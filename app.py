@@ -58,7 +58,7 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import folium
 import geopandas as gpd
@@ -761,11 +761,19 @@ def create_map(
 
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    padding = 0.03
+    # Dynamic map fit: padding scales with ZIP size so small ZIPs don't look tiny
+    minx, miny, maxx, maxy = map(float, bounds)
+    width = max(maxx - minx, 1e-12)
+    height = max(maxy - miny, 1e-12)
+
+    pad_frac = 0.08  # 8% of the bbox size
+    pad_x = min(max(width * pad_frac, 0.0015), 0.25)
+    pad_y = min(max(height * pad_frac, 0.0015), 0.25)
+
     m.fit_bounds(
         [
-            [float(bounds[1]) - padding, float(bounds[0]) - padding],
-            [float(bounds[3]) + padding, float(bounds[2]) + padding],
+            [miny - pad_y, minx - pad_x],
+            [maxy + pad_y, maxx + pad_x],
         ]
     )
     return m
