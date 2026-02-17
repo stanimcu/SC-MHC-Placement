@@ -213,6 +213,8 @@ if "method_used" not in st.session_state:
     st.session_state.method_used = "Manhattan Distance"
 if "last_params" not in st.session_state:
     st.session_state.last_params = {}
+if "covered_demand_count" not in st.session_state:
+    st.session_state.covered_demand_count = 0
 
 # ===========================
 # DATA LOADING
@@ -344,6 +346,14 @@ def estimate_required_graph_dist_m(center_lat, center_lon, candidates_df, demand
 
     return int(max(min_dist, maxd + buffer_m))
 
+
+@st.cache_resource(show_spinner=False)
+def get_cached_graph(center_lat, center_lon, dist_m, network_type):
+    """Cache the OSM graph download AND preprocessing — avoids re-downloading and re-processing."""
+    G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type=network_type)
+    G = preprocess_network_speeds(G, network_type)
+    return G
+
 # ===========================
 # SPEED / TRAVEL TIME
 # ===========================
@@ -381,31 +391,6 @@ def preprocess_network_speeds(G, network_type="drive"):
 
     return G
 
-def calculate_network_travel_time_preprocessed(G, origin, destinations_df, max_time_minutes):
-    if G is None:
-        return np.full(len(destinations_df), np.nan)
-
-    origin_node = nearest_node_safe(G, origin[1], origin[0])
-    if origin_node is None:
-        return np.full(len(destinations_df), np.nan)
-
-    try:
-        lengths = nx.single_source_dijkstra_path_length(G, origin_node, cutoff=max_time_minutes, weight="travel_time")
-    except Exception:
-        return np.full(len(destinations_df), np.nan)
-
-    travel_times = []
-    for _, dest in destinations_df.iterrows():
-        dest_node = nearest_node_safe(G, dest["longitude"], dest["latitude"])
-        if dest_node is None:
-            travel_times.append(np.nan)
-        elif dest_node in lengths:
-            travel_times.append(lengths[dest_node])
-        else:
-            travel_times.append(np.nan)
-
-    return np.array(travel_times)
-
 def calculate_manhattan_distance_time(origin_lat, origin_lon, dest_lat, dest_lon, mode="drive"):
     lat_diff = abs(dest_lat - origin_lat) * 69
     lon_diff = abs(dest_lon - origin_lon) * 69 * np.cos(np.radians(origin_lat))
@@ -417,39 +402,64 @@ def calculate_manhattan_distance_time(origin_lat, origin_lon, dest_lat, dest_lon
     manhattan_km = manhattan_miles * 1.60934
     return (manhattan_km / WALKING_SPEED_KMH) * 60
 
+
+def calculate_manhattan_times_vectorized(origin_lat, origin_lon, dest_lats, dest_lons, mode="drive"):
+    """Vectorized Manhattan travel time: one origin → many destinations at once."""
+    lat_diff = np.abs(dest_lats - origin_lat) * 69.0
+    lon_diff = np.abs(dest_lons - origin_lon) * 69.0 * np.cos(np.radians(origin_lat))
+    manhattan_miles = (lat_diff + lon_diff) * CIRCUITY_FACTOR
+
+    if mode == "drive":
+        return (manhattan_miles / DEFAULT_DRIVING_SPEED) * 60.0
+
+    manhattan_km = manhattan_miles * 1.60934
+    return (manhattan_km / WALKING_SPEED_KMH) * 60.0
+
 # ===========================
 # COVERAGE MATRIX
 # ===========================
 def build_coverage_matrix(candidates_subset, demand_subset, max_time, network_type="drive", use_network=False, G=None):
     n_facilities = len(candidates_subset)
     n_demand = len(demand_subset)
-    coverage = np.zeros((n_facilities, n_demand), dtype=int)
+    coverage = np.zeros((n_facilities, n_demand), dtype=np.int8)
 
     candidates_reset = candidates_subset.reset_index(drop=True)
     demand_reset = demand_subset.reset_index(drop=True)
 
     if use_network and G is not None:
-        G = preprocess_network_speeds(G, network_type)
+        # Graph is already preprocessed by get_cached_graph()
 
-    for i, facility in candidates_reset.iterrows():
-        facility_point = (facility["latitude"], facility["longitude"])
+        # Batch-snap all demand nodes ONCE (instead of per-facility)
+        demand_nodes = []
+        for _, d in demand_reset.iterrows():
+            demand_nodes.append(nearest_node_safe(G, d["longitude"], d["latitude"]))
 
-        if use_network and G is not None:
-            travel_times = calculate_network_travel_time_preprocessed(G, facility_point, demand_reset, max_time)
-            for j in range(len(travel_times)):
-                if not np.isnan(travel_times[j]) and travel_times[j] <= max_time:
-                    coverage[i, j] = 1
-        else:
-            for j, demand_pt in demand_reset.iterrows():
-                travel_time = calculate_manhattan_distance_time(
-                    facility["latitude"],
-                    facility["longitude"],
-                    demand_pt["latitude"],
-                    demand_pt["longitude"],
-                    mode=network_type,
+        for i, facility in candidates_reset.iterrows():
+            origin_node = nearest_node_safe(G, facility["longitude"], facility["latitude"])
+            if origin_node is None:
+                continue
+
+            try:
+                lengths = nx.single_source_dijkstra_path_length(
+                    G, origin_node, cutoff=max_time, weight="travel_time"
                 )
-                if travel_time <= max_time:
+            except Exception:
+                continue
+
+            for j, dnode in enumerate(demand_nodes):
+                if dnode is not None and dnode in lengths and lengths[dnode] <= max_time:
                     coverage[i, j] = 1
+    else:
+        # Vectorized Manhattan: pre-extract arrays, compute all demand points per facility at once
+        d_lats = demand_reset["latitude"].values.astype(np.float64)
+        d_lons = demand_reset["longitude"].values.astype(np.float64)
+
+        for i, facility in candidates_reset.iterrows():
+            times = calculate_manhattan_times_vectorized(
+                facility["latitude"], facility["longitude"],
+                d_lats, d_lons, mode=network_type,
+            )
+            coverage[i, :] = (times <= max_time).astype(np.int8)
 
     return coverage, candidates_reset, demand_reset
 
@@ -545,30 +555,38 @@ def create_map(
 
     analysis_complete = selected_facilities is not None and coverage_matrix is not None and demand_reset is not None
 
-    # Compute covered demand indices (in demand_reset index-space)
+    # Vectorized covered demand indices (replaces O(D×S) nested loop)
     covered_demand_indices = set()
     if analysis_complete:
-        selected_idx = list(selected_facilities.index)  # indices in candidates_reset space
-        for j in range(len(demand_reset)):
-            for i in selected_idx:
-                if coverage_matrix[i, j] == 1:
-                    covered_demand_indices.add(j)
-                    break
+        selected_idx = list(selected_facilities.index)
+        covered_mask = np.any(coverage_matrix[selected_idx, :], axis=0)
+        covered_demand_indices = set(np.where(covered_mask)[0])
+
+    # Pre-build selected facility lookup set (replaces O(F×S) inner loop)
+    selected_coords = set()
+    if analysis_complete:
+        for _, sel in selected_facilities.iterrows():
+            selected_coords.add((round(float(sel["latitude"]), 4), round(float(sel["longitude"]), 4)))
+
+    # Pre-build demand_reset lookup dict: (lat, lon) → reset_index (replaces O(D²) inner loop)
+    demand_reset_lookup = {}
+    if analysis_complete:
+        for reset_idx in range(len(demand_reset)):
+            key = (
+                round(float(demand_reset.iloc[reset_idx]["latitude"]), 4),
+                round(float(demand_reset.iloc[reset_idx]["longitude"]), 4),
+            )
+            demand_reset_lookup[key] = reset_idx
 
     # Facilities
     if analysis_complete:
-        # mark selected sites based on lat/lon matching
         for _, facility in candidates_in_zip.iterrows():
             lat = float(facility["latitude"])
             lon = float(facility["longitude"])
             name = str(facility.get("name", ""))
             ftype = str(facility.get("type", ""))
 
-            is_selected = False
-            for _, sel in selected_facilities.iterrows():
-                if abs(lat - float(sel["latitude"])) < 0.0001 and abs(lon - float(sel["longitude"])) < 0.0001:
-                    is_selected = True
-                    break
+            is_selected = (round(lat, 4), round(lon, 4)) in selected_coords
 
             if is_selected:
                 folium.Marker(
@@ -608,16 +626,8 @@ def create_map(
             lon = float(demand["longitude"])
             uninsured = float(demand["uninsured_pop"]) if pd.notna(demand["uninsured_pop"]) else 0.0
 
-            # find matching index in demand_reset (lat/lon match)
-            demand_reset_index = None
-            for reset_idx in range(len(demand_reset)):
-                if (
-                    abs(float(demand_reset.iloc[reset_idx]["latitude"]) - float(demand["latitude"])) < 0.0001
-                    and abs(float(demand_reset.iloc[reset_idx]["longitude"]) - float(demand["longitude"])) < 0.0001
-                ):
-                    demand_reset_index = reset_idx
-                    break
-
+            # O(1) dict lookup instead of O(D) scan
+            demand_reset_index = demand_reset_lookup.get((round(lat, 4), round(lon, 4)))
             is_covered = (demand_reset_index in covered_demand_indices)
 
             if is_covered:
@@ -878,10 +888,9 @@ def main():
                             min_dist=15000,
                             buffer_m=buffer_m,
                         )
-                        G = ox.graph_from_point(
-                            (zip_center.y, zip_center.x),
-                            dist=graph_dist_m,
-                            network_type=network_type,
+                        G = get_cached_graph(
+                            zip_center.y, zip_center.x,
+                            graph_dist_m, network_type,
                         )
                     method_used = "Road Network (OSM maxspeed tags, turn penalties)"
                 except Exception as e:
@@ -915,6 +924,10 @@ def main():
             st.session_state.covered_pop = covered_pop
             st.session_state.method_used = method_used
             st.session_state.last_params = current_params
+            # Compute covered demand count ONCE (vectorized)
+            st.session_state.covered_demand_count = int(
+                np.any(coverage_matrix[selected_indices, :], axis=0).sum()
+            )
 
     # Map display
     with col_map:
@@ -942,20 +955,9 @@ def main():
             cov_pop = float(st.session_state.covered_pop)
             pct = (cov_pop / total_uninsured) * 100 if total_uninsured > 0 else 0.0
 
-            _cov_matrix = st.session_state.coverage_matrix
-            _sel_fac = st.session_state.selected_facilities
-            _dem_reset = st.session_state.demand_reset
-            _sel_idx = list(_sel_fac.index)
-            _covered_count = 0
-            for _j in range(_cov_matrix.shape[1]):
-                for _i in _sel_idx:
-                    if _cov_matrix[_i, _j] == 1:
-                        _covered_count += 1
-                        break
-
             st.metric("Covered Uninsured Population", f"{int(round(cov_pop)):,}")
             st.metric("Coverage Percentage", f"{pct:.1f}%")
-            st.metric("Covered Demand Points", f"{_covered_count} / {len(_dem_reset)}")
+            st.metric("Covered Demand Points", f"{st.session_state.covered_demand_count} / {len(st.session_state.demand_reset)}")
             st.progress(min(max(pct / 100.0, 0.0), 1.0))
             st.caption(f"Method: {st.session_state.method_used}")
 
@@ -968,16 +970,7 @@ def main():
         coverage_matrix = st.session_state.coverage_matrix
         demand_reset = st.session_state.demand_reset
 
-        # Covered demand points count
-        covered_demand_count = 0
-        selected_idx = list(selected_facilities.index)  # indices align with candidates_reset positions
-        for j in range(coverage_matrix.shape[1]):
-            for i in selected_idx:
-                if coverage_matrix[i, j] == 1:
-                    covered_demand_count += 1
-                    break
-
-        st.caption(f"Covered demand points: {covered_demand_count:,} of {len(demand_reset):,}")
+        st.caption(f"Covered demand points: {st.session_state.covered_demand_count:,} of {len(demand_reset):,}")
 
         # Individual coverage per selected facility (simple ranking)
         facility_coverage = []
