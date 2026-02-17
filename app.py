@@ -7,18 +7,18 @@ METHODOLOGY DOCUMENTATION:
 
 1. LOCATION-ALLOCATION MODEL TYPE:
    - Maximum Coverage Location Problem (MCLP)
-   - Objective: Maximize the total covered demand (uninsured population) subject to selecting 
+   - Objective: Maximize the total covered demand (uninsured population) subject to selecting
      exactly P facilities from a set of candidate locations
-   
+
 2. NETWORK ANALYSIS DATA SOURCES:
    When "Use Road Network Analysis" is enabled:
    - Network Data: OpenStreetMap (OSM) via OSMnx library
-   - Road Network Type: 
+   - Road Network Type:
      * 'drive' mode: Drivable roads with speeds from actual OSM maxspeed tags
      * 'walk' mode: Walkable paths (includes sidewalks, pedestrian paths)
-   
+
 3. TRAVEL TIME CALCULATION:
-   
+
    A. Network-Based (when enabled):
       - Method: Dijkstra's shortest path algorithm on actual road network
       - Distance Metric: Network distance (meters along roads)
@@ -27,46 +27,51 @@ METHODOLOGY DOCUMENTATION:
         * Primary source: OSM `maxspeed` tags (actual posted speed limits)
         * Imputation: Mean maxspeed of same highway type when tag is missing
         * Fallback: SC-appropriate defaults per highway classification
-        
+
         WALKING:
-        * All paths: 5 km/h (3.1 mph) - standard pedestrian speed
-      
+        * All paths: 5 km/h (3.1 mph), standard pedestrian speed
+
       - Turn Penalties: 5-second delay per edge approximating intersection costs
       - Time Calculation: (Network distance / speed) + turn penalty per edge
-      - Network Buffer: Dynamically sized to cover all candidate/demand points
-   
+      - Network Buffer: Dynamically sized to cover all candidate and demand points
+
    B. Manhattan Distance (default):
-      - Method: Rectilinear distance x road circuity factor (1.2x)
+      - Method: Rectilinear distance times a road circuity factor (1.2x)
       - Speed: Average 25 mph for driving, 5 km/h for walking
-   
+
    NOTE: OpenStreetMap does not include historical traffic data. For ArcGIS-style
-   historical speeds, you would need Esri StreetMap Premium / HERE data (commercial).
-   This tool uses actual posted speed limits from OSM as the best free alternative.
-   
+   historical speeds, you would need Esri StreetMap Premium or HERE data (commercial).
+   This tool uses posted speed limits from OSM as the best free alternative.
+
 4. COVERAGE DETERMINATION:
    - A facility "covers" a demand point if travel time <= threshold
    - Binary coverage matrix: C[i,j] = 1 if facility i covers demand point j, 0 otherwise
    - Coverage is weighted by uninsured population at each demand point
-   
+
 5. OPTIMIZATION SOLVER:
    - Solver: PuLP with CBC (COIN-OR Branch and Cut) solver
    - Problem Type: Integer Linear Programming (ILP)
 """
 
+from __future__ import annotations
+
+import json
+import warnings
+from pathlib import Path
+from typing import Optional, Tuple
+
+import folium
+import geopandas as gpd
+import networkx as nx
+import numpy as np
+import osmnx as ox
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-import pandas as pd
-import geopandas as gpd
-import folium
-import json
-from pathlib import Path
-import numpy as np
-from pulp import LpProblem, LpMaximize, LpVariable, lpSum, PULP_CBC_CMD
-import osmnx as ox
-import networkx as nx
+from pulp import LpMaximize, LpProblem, LpVariable, PULP_CBC_CMD, lpSum
 from shapely.geometry import Polygon
 from streamlit_folium import st_folium
-import warnings
+
 from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
@@ -82,7 +87,7 @@ st.set_page_config(
 )
 
 # ===========================
-# BRANDING & CUSTOM CSS
+# BRANDING AND CUSTOM CSS
 # ===========================
 def local_css():
     st.markdown(
@@ -147,14 +152,14 @@ local_css()
 # ===========================
 # SAFE MAP RENDERING (fixes JSON serialization error from st_folium)
 # ===========================
-def render_folium_map(m, key="map", height=640):
+def render_folium_map(m: folium.Map, key: str = "map", height: int = 640):
     try:
         st_folium(
             m,
             key=key,
             height=height,
             use_container_width=True,
-            returned_objects=[],   # ← THIS is what stops the infinite loop
+            returned_objects=[],  # stops recursion in some Streamlit + folium combos
         )
     except Exception:
         components.html(m.get_root().render(), height=height, scrolling=True)
@@ -162,10 +167,6 @@ def render_folium_map(m, key="map", height=640):
 # ===========================
 # CONFIGURATION
 # ===========================
-
-#JSON_PATH = Path("sc_app_data.json")
-
-
 DEFAULT_USE_NETWORK = False
 DEFAULT_NUM_FACILITIES = 3
 
@@ -209,18 +210,22 @@ if "candidates_reset" not in st.session_state:
     st.session_state.candidates_reset = None
 if "covered_pop" not in st.session_state:
     st.session_state.covered_pop = 0.0
+if "covered_mask" not in st.session_state:
+    st.session_state.covered_mask = None
 if "method_used" not in st.session_state:
     st.session_state.method_used = "Manhattan Distance"
 if "last_params" not in st.session_state:
     st.session_state.last_params = {}
-if "covered_demand_count" not in st.session_state:
-    st.session_state.covered_demand_count = 0
+if "selected_cand_ids" not in st.session_state:
+    st.session_state.selected_cand_ids = None
+if "covered_dem_ids" not in st.session_state:
+    st.session_state.covered_dem_ids = None
 
 # ===========================
 # DATA LOADING
 # ===========================
 @st.cache_data
-def load_data(json_path: Path):
+def load_data(json_path: Path) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     with open(json_path, "r") as f:
         data = json.load(f)
 
@@ -266,6 +271,10 @@ def load_data(json_path: Path):
         raise ValueError("No demand points found in JSON.")
     demand_df = pd.DataFrame(demand_data)
 
+    # Stable row identifiers for fast membership tests later
+    candidates_df["cand_idx"] = np.arange(len(candidates_df), dtype=int)
+    demand_df["dem_idx"] = np.arange(len(demand_df), dtype=int)
+
     # Clean types
     for df in (candidates_df, demand_df):
         if "zip_code" in df.columns:
@@ -279,39 +288,86 @@ def load_data(json_path: Path):
 
     # GeoDataFrames
     if "longitude" in candidates_df.columns and "latitude" in candidates_df.columns:
-        candidates_df = gpd.GeoDataFrame(
+        candidates_gdf = gpd.GeoDataFrame(
             candidates_df,
             geometry=gpd.points_from_xy(candidates_df["longitude"], candidates_df["latitude"]),
             crs="EPSG:4326",
         )
+    else:
+        raise ValueError("Candidates must include latitude and longitude.")
 
     if "longitude" in demand_df.columns and "latitude" in demand_df.columns:
-        demand_df = gpd.GeoDataFrame(
+        demand_gdf = gpd.GeoDataFrame(
             demand_df,
             geometry=gpd.points_from_xy(demand_df["longitude"], demand_df["latitude"]),
             crs="EPSG:4326",
         )
+    else:
+        raise ValueError("Demand points must include latitude and longitude.")
 
-    return zip_gdf, candidates_df, demand_df
+    # Precompute ZIP membership once (faster than repeated intersects filters)
+    try:
+        _zip = zip_gdf[["ZIP_CODE", "geometry"]].copy()
+        candidates_gdf = gpd.sjoin(candidates_gdf, _zip, how="left", predicate="intersects").drop(columns=["index_right"])
+        demand_gdf = gpd.sjoin(demand_gdf, _zip, how="left", predicate="intersects").drop(columns=["index_right"])
+        candidates_gdf = candidates_gdf.rename(columns={"ZIP_CODE": "zip_join"})
+        demand_gdf = demand_gdf.rename(columns={"ZIP_CODE": "zip_join"})
+    except Exception:
+        # If sjoin fails for any reason, fall back to original zip_code column later
+        if "zip_join" not in candidates_gdf.columns:
+            candidates_gdf["zip_join"] = np.nan
+        if "zip_join" not in demand_gdf.columns:
+            demand_gdf["zip_join"] = np.nan
+
+    return zip_gdf, candidates_gdf, demand_gdf
 
 # ===========================
 # NETWORK HELPERS
 # ===========================
-def nearest_node_safe(G, lon, lat, max_snap_dist_m=MAX_SNAP_DIST_M):
+def nearest_node_safe(G: nx.MultiDiGraph, lon: float, lat: float, max_snap_dist_m: float = MAX_SNAP_DIST_M):
     try:
-        node, dist = ox.nearest_nodes(G, lon, lat, return_dist=True)
+        node, dist = ox.distance.nearest_nodes(G, lon, lat, return_dist=True)
         if dist is not None and dist > max_snap_dist_m:
             return None
         return node
     except TypeError:
         try:
-            return ox.nearest_nodes(G, lon, lat)
+            return ox.distance.nearest_nodes(G, lon, lat)
         except Exception:
             return None
     except Exception:
         return None
 
-def estimate_required_graph_dist_m(center_lat, center_lon, candidates_df, demand_df, min_dist=15000, buffer_m=5000):
+def snap_points_to_nodes(
+    G: nx.MultiDiGraph,
+    lons: np.ndarray,
+    lats: np.ndarray,
+    max_snap_dist_m: float = MAX_SNAP_DIST_M,
+) -> np.ndarray:
+    lons = np.asarray(lons, dtype=float)
+    lats = np.asarray(lats, dtype=float)
+    out = np.empty(len(lons), dtype=object)
+
+    try:
+        nodes, dists = ox.distance.nearest_nodes(G, X=lons, Y=lats, return_dist=True)
+        nodes = np.asarray(nodes, dtype=object)
+        dists = np.asarray(dists, dtype=float)
+        nodes[dists > max_snap_dist_m] = None
+        out[:] = nodes
+        return out
+    except Exception:
+        for i, (lon, lat) in enumerate(zip(lons, lats)):
+            out[i] = nearest_node_safe(G, float(lon), float(lat), max_snap_dist_m)
+        return out
+
+def estimate_required_graph_dist_m(
+    center_lat: float,
+    center_lon: float,
+    candidates_df: Optional[pd.DataFrame],
+    demand_df: Optional[pd.DataFrame],
+    min_dist: int = 15000,
+    buffer_m: int = 5000,
+) -> int:
     pts = []
     if candidates_df is not None and len(candidates_df) > 0:
         pts.append(candidates_df[["latitude", "longitude"]])
@@ -346,20 +402,12 @@ def estimate_required_graph_dist_m(center_lat, center_lon, candidates_df, demand
 
     return int(max(min_dist, maxd + buffer_m))
 
-
-@st.cache_resource(show_spinner=False)
-def get_cached_graph(center_lat, center_lon, dist_m, network_type):
-    """Cache the OSM graph download AND preprocessing — avoids re-downloading and re-processing."""
-    G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type=network_type)
-    G = preprocess_network_speeds(G, network_type)
-    return G
-
 # ===========================
-# SPEED / TRAVEL TIME
+# SPEED AND TRAVEL TIME
 # ===========================
-def preprocess_network_speeds(G, network_type="drive"):
+def preprocess_network_speeds(G: nx.MultiDiGraph, network_type: str = "drive") -> nx.MultiDiGraph:
     if network_type == "walk":
-        for u, v, k, data in G.edges(data=True, keys=True):
+        for _, _, _, data in G.edges(data=True, keys=True):
             data["speed_kph"] = WALKING_SPEED_KMH
             length_km = data["length"] / 1000.0
             tt_seconds = (length_km / WALKING_SPEED_KMH) * 3600.0
@@ -377,7 +425,7 @@ def preprocess_network_speeds(G, network_type="drive"):
                     G = ox.speed.add_edge_speeds(G, hwy_speeds=SC_HIGHWAY_SPEEDS_KMH, fallback=SC_FALLBACK_SPEED_KMH)
                     G = ox.speed.add_edge_travel_times(G)
                 except Exception:
-                    for u, v, k, data in G.edges(data=True, keys=True):
+                    for _, _, _, data in G.edges(data=True, keys=True):
                         road_type = data.get("highway", "unclassified")
                         if isinstance(road_type, list):
                             road_type = road_type[0]
@@ -385,28 +433,27 @@ def preprocess_network_speeds(G, network_type="drive"):
                         length_km = data["length"] / 1000.0
                         data["travel_time"] = (length_km / data["speed_kph"]) * 3600.0
 
-        for u, v, k, data in G.edges(data=True, keys=True):
+        for _, _, _, data in G.edges(data=True, keys=True):
             tt_sec = data.get("travel_time", 0)
             data["travel_time"] = (tt_sec + TURN_PENALTY_SECONDS) / 60.0
 
     return G
 
-def calculate_manhattan_distance_time(origin_lat, origin_lon, dest_lat, dest_lon, mode="drive"):
-    lat_diff = abs(dest_lat - origin_lat) * 69
-    lon_diff = abs(dest_lon - origin_lon) * 69 * np.cos(np.radians(origin_lat))
-    manhattan_miles = (lat_diff + lon_diff) * CIRCUITY_FACTOR
+@st.cache_resource(show_spinner=False)
+def get_osm_graph(center_lat: float, center_lon: float, dist_m: int, network_type: str) -> nx.MultiDiGraph:
+    G = ox.graph_from_point((center_lat, center_lon), dist=int(dist_m), network_type=network_type)
+    G = preprocess_network_speeds(G, network_type)
+    return G
 
-    if mode == "drive":
-        return (manhattan_miles / DEFAULT_DRIVING_SPEED) * 60
-
-    manhattan_km = manhattan_miles * 1.60934
-    return (manhattan_km / WALKING_SPEED_KMH) * 60
-
-
-def calculate_manhattan_times_vectorized(origin_lat, origin_lon, dest_lats, dest_lons, mode="drive"):
-    """Vectorized Manhattan travel time: one origin → many destinations at once."""
-    lat_diff = np.abs(dest_lats - origin_lat) * 69.0
-    lon_diff = np.abs(dest_lons - origin_lon) * 69.0 * np.cos(np.radians(origin_lat))
+def calculate_manhattan_distance_time(
+    origin_lat: float,
+    origin_lon: float,
+    dest_lat: float,
+    dest_lon: float,
+    mode: str = "drive",
+) -> float:
+    lat_diff = abs(dest_lat - origin_lat) * 69.0
+    lon_diff = abs(dest_lon - origin_lon) * 69.0 * np.cos(np.radians(origin_lat))
     manhattan_miles = (lat_diff + lon_diff) * CIRCUITY_FACTOR
 
     if mode == "drive":
@@ -418,68 +465,102 @@ def calculate_manhattan_times_vectorized(origin_lat, origin_lon, dest_lats, dest
 # ===========================
 # COVERAGE MATRIX
 # ===========================
-def build_coverage_matrix(candidates_subset, demand_subset, max_time, network_type="drive", use_network=False, G=None):
-    n_facilities = len(candidates_subset)
-    n_demand = len(demand_subset)
-    coverage = np.zeros((n_facilities, n_demand), dtype=np.int8)
+def build_coverage_matrix(
+    candidates_subset: gpd.GeoDataFrame,
+    demand_subset: gpd.GeoDataFrame,
+    max_time: float,
+    network_type: str = "drive",
+    use_network: bool = False,
+    G: Optional[nx.MultiDiGraph] = None,
+) -> Tuple[np.ndarray, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    candidates_reset = candidates_subset.reset_index(drop=True).copy()
+    demand_reset = demand_subset.reset_index(drop=True).copy()
 
-    candidates_reset = candidates_subset.reset_index(drop=True)
-    demand_reset = demand_subset.reset_index(drop=True)
+    n_facilities = len(candidates_reset)
+    n_demand = len(demand_reset)
+
+    if n_facilities == 0 or n_demand == 0:
+        return np.zeros((n_facilities, n_demand), dtype=np.uint8), candidates_reset, demand_reset
 
     if use_network and G is not None:
-        # Graph is already preprocessed by get_cached_graph()
+        coverage = np.zeros((n_facilities, n_demand), dtype=np.uint8)
 
-        # Batch-snap all demand nodes ONCE (instead of per-facility)
-        demand_nodes = []
-        for _, d in demand_reset.iterrows():
-            demand_nodes.append(nearest_node_safe(G, d["longitude"], d["latitude"]))
+        dem_nodes = snap_points_to_nodes(
+            G,
+            demand_reset["longitude"].to_numpy(),
+            demand_reset["latitude"].to_numpy(),
+            MAX_SNAP_DIST_M,
+        )
+        fac_nodes = snap_points_to_nodes(
+            G,
+            candidates_reset["longitude"].to_numpy(),
+            candidates_reset["latitude"].to_numpy(),
+            MAX_SNAP_DIST_M,
+        )
 
-        for i, facility in candidates_reset.iterrows():
-            origin_node = nearest_node_safe(G, facility["longitude"], facility["latitude"])
+        # Dijkstra per facility, destinations are already snapped
+        for i, origin_node in enumerate(fac_nodes):
             if origin_node is None:
                 continue
-
             try:
                 lengths = nx.single_source_dijkstra_path_length(
-                    G, origin_node, cutoff=max_time, weight="travel_time"
+                    G, origin_node, cutoff=float(max_time), weight="travel_time"
                 )
             except Exception:
                 continue
 
-            for j, dnode in enumerate(demand_nodes):
-                if dnode is not None and dnode in lengths and lengths[dnode] <= max_time:
-                    coverage[i, j] = 1
-    else:
-        # Vectorized Manhattan: pre-extract arrays, compute all demand points per facility at once
-        d_lats = demand_reset["latitude"].values.astype(np.float64)
-        d_lons = demand_reset["longitude"].values.astype(np.float64)
-
-        for i, facility in candidates_reset.iterrows():
-            times = calculate_manhattan_times_vectorized(
-                facility["latitude"], facility["longitude"],
-                d_lats, d_lons, mode=network_type,
+            row = np.fromiter(
+                ((lengths.get(n, np.inf) <= max_time) if n is not None else False for n in dem_nodes),
+                dtype=np.bool_,
+                count=n_demand,
             )
-            coverage[i, :] = (times <= max_time).astype(np.int8)
+            coverage[i, :] = row.astype(np.uint8)
 
+        return coverage, candidates_reset, demand_reset
+
+    # Manhattan distance, fully vectorized
+    clat = candidates_reset["latitude"].to_numpy(dtype=float)[:, None]
+    clon = candidates_reset["longitude"].to_numpy(dtype=float)[:, None]
+    dlat = demand_reset["latitude"].to_numpy(dtype=float)[None, :]
+    dlon = demand_reset["longitude"].to_numpy(dtype=float)[None, :]
+
+    lat_diff = np.abs(dlat - clat) * 69.0
+    lon_diff = np.abs(dlon - clon) * 69.0 * np.cos(np.radians(clat))
+    miles = (lat_diff + lon_diff) * CIRCUITY_FACTOR
+
+    if network_type == "drive":
+        tt = (miles / DEFAULT_DRIVING_SPEED) * 60.0
+    else:
+        km = miles * 1.60934
+        tt = (km / WALKING_SPEED_KMH) * 60.0
+
+    coverage = (tt <= float(max_time)).astype(np.uint8)
     return coverage, candidates_reset, demand_reset
 
 # ===========================
 # OPTIMIZATION SOLVER
 # ===========================
-def solve_maxcover(coverage_matrix, demand_weights, num_facilities):
+def solve_maxcover(
+    coverage_matrix: np.ndarray,
+    demand_weights: np.ndarray,
+    num_facilities: int,
+) -> Tuple[list[int], float, np.ndarray]:
     n_facilities, n_demand = coverage_matrix.shape
 
     model = LpProblem("Max_Coverage", LpMaximize)
     x = LpVariable.dicts("facility", range(n_facilities), cat="Binary")
     y = LpVariable.dicts("covered", range(n_demand), cat="Binary")
 
-    model += lpSum([demand_weights[j] * y[j] for j in range(n_demand)])
-    model += lpSum([x[i] for i in range(n_facilities)]) == num_facilities
+    demand_weights = np.asarray(demand_weights, dtype=float)
 
+    model += lpSum(demand_weights[j] * y[j] for j in range(n_demand))
+    model += lpSum(x[i] for i in range(n_facilities)) == int(num_facilities)
+
+    # Precompute coverers for each demand point (faster than scanning in every constraint)
     for j in range(n_demand):
-        covering = [i for i in range(n_facilities) if coverage_matrix[i, j] == 1]
-        if covering:
-            model += y[j] <= lpSum([x[i] for i in covering])
+        coverers = np.where(coverage_matrix[:, j] == 1)[0]
+        if coverers.size:
+            model += y[j] <= lpSum(x[int(i)] for i in coverers)
         else:
             model += y[j] == 0
 
@@ -488,26 +569,26 @@ def solve_maxcover(coverage_matrix, demand_weights, num_facilities):
     selected = [i for i in range(n_facilities) if x[i].varValue is not None and x[i].varValue > 0.5]
 
     if selected:
-        covered_mask = (coverage_matrix[selected, :].sum(axis=0) > 0)
-        covered_demand = float(np.sum(np.asarray(demand_weights)[covered_mask]))
+        covered_mask = coverage_matrix[selected, :].any(axis=0)
+        covered_demand = float(demand_weights[covered_mask].sum())
     else:
+        covered_mask = np.zeros(n_demand, dtype=bool)
         covered_demand = 0.0
 
-    return selected, covered_demand
+    return selected, covered_demand, covered_mask
 
 # ===========================
 # MAP CREATION
 # ===========================
 def create_map(
-    zip_gdf,
-    selected_zip,
-    candidates_df,
-    demand_df,
-    selected_facilities=None,
-    coverage_matrix=None,
-    demand_reset=None,
-    tiles="CartoDB positron",
-):
+    zip_gdf: gpd.GeoDataFrame,
+    selected_zip: str,
+    candidates_df: gpd.GeoDataFrame,
+    demand_df: gpd.GeoDataFrame,
+    selected_cand_ids: Optional[set[int]] = None,
+    covered_dem_ids: Optional[set[int]] = None,
+    tiles: str = "CartoDB positron",
+) -> folium.Map:
     zip_boundary = zip_gdf[zip_gdf["ZIP_CODE"] == selected_zip].iloc[0]
     bounds = zip_boundary.geometry.bounds
     center_lat = float((bounds[1] + bounds[3]) / 2)
@@ -520,10 +601,9 @@ def create_map(
         prefer_canvas=True,
     )
 
-    # ZIP boundary
     folium.GeoJson(
         zip_boundary.geometry.__geo_interface__,
-        style_function=lambda x: {
+        style_function=lambda _: {
             "fillColor": "#E6F2FF",
             "color": "#1E90FF",
             "weight": 4,
@@ -541,42 +621,18 @@ def create_map(
         "Rural Primary Care": "pink",
     }
 
-    # Spatial filter: candidates in ZIP
-    if "geometry" in candidates_df.columns:
+    # Fast ZIP filters if zip_join exists
+    if "zip_join" in candidates_df.columns and candidates_df["zip_join"].notna().any():
+        candidates_in_zip = candidates_df[candidates_df["zip_join"] == selected_zip]
+    else:
         candidates_in_zip = candidates_df[candidates_df.geometry.intersects(zip_boundary.geometry)]
-    else:
-        candidates_in_zip = candidates_df[candidates_df["zip_code"] == selected_zip]
 
-    # Spatial filter: demand in ZIP
-    if "geometry" in demand_df.columns:
+    if "zip_join" in demand_df.columns and demand_df["zip_join"].notna().any():
+        demand_in_zip = demand_df[demand_df["zip_join"] == selected_zip]
+    else:
         demand_in_zip = demand_df[demand_df.geometry.intersects(zip_boundary.geometry)]
-    else:
-        demand_in_zip = demand_df[demand_df["zip_code"] == selected_zip]
 
-    analysis_complete = selected_facilities is not None and coverage_matrix is not None and demand_reset is not None
-
-    # Vectorized covered demand indices (replaces O(D×S) nested loop)
-    covered_demand_indices = set()
-    if analysis_complete:
-        selected_idx = list(selected_facilities.index)
-        covered_mask = np.any(coverage_matrix[selected_idx, :], axis=0)
-        covered_demand_indices = set(np.where(covered_mask)[0])
-
-    # Pre-build selected facility lookup set (replaces O(F×S) inner loop)
-    selected_coords = set()
-    if analysis_complete:
-        for _, sel in selected_facilities.iterrows():
-            selected_coords.add((round(float(sel["latitude"]), 4), round(float(sel["longitude"]), 4)))
-
-    # Pre-build demand_reset lookup dict: (lat, lon) → reset_index (replaces O(D²) inner loop)
-    demand_reset_lookup = {}
-    if analysis_complete:
-        for reset_idx in range(len(demand_reset)):
-            key = (
-                round(float(demand_reset.iloc[reset_idx]["latitude"]), 4),
-                round(float(demand_reset.iloc[reset_idx]["longitude"]), 4),
-            )
-            demand_reset_lookup[key] = reset_idx
+    analysis_complete = (selected_cand_ids is not None) and (covered_dem_ids is not None)
 
     # Facilities
     if analysis_complete:
@@ -586,7 +642,7 @@ def create_map(
             name = str(facility.get("name", ""))
             ftype = str(facility.get("type", ""))
 
-            is_selected = (round(lat, 4), round(lon, 4)) in selected_coords
+            is_selected = int(facility.get("cand_idx", -1)) in selected_cand_ids
 
             if is_selected:
                 folium.Marker(
@@ -624,11 +680,9 @@ def create_map(
         for _, demand in demand_in_zip.iterrows():
             lat = float(demand["latitude"])
             lon = float(demand["longitude"])
-            uninsured = float(demand["uninsured_pop"]) if pd.notna(demand["uninsured_pop"]) else 0.0
+            uninsured = float(demand["uninsured_pop"]) if pd.notna(demand.get("uninsured_pop", np.nan)) else 0.0
 
-            # O(1) dict lookup instead of O(D) scan
-            demand_reset_index = demand_reset_lookup.get((round(lat, 4), round(lon, 4)))
-            is_covered = (demand_reset_index in covered_demand_indices)
+            is_covered = int(demand.get("dem_idx", -1)) in covered_dem_ids
 
             if is_covered:
                 color = "#7CFC90"
@@ -653,7 +707,7 @@ def create_map(
         for _, demand in demand_in_zip.iterrows():
             lat = float(demand["latitude"])
             lon = float(demand["longitude"])
-            uninsured = float(demand["uninsured_pop"]) if pd.notna(demand["uninsured_pop"]) else 0.0
+            uninsured = float(demand["uninsured_pop"]) if pd.notna(demand.get("uninsured_pop", np.nan)) else 0.0
 
             folium.CircleMarker(
                 location=[lat, lon],
@@ -714,18 +768,14 @@ def create_map(
             [float(bounds[3]) + padding, float(bounds[2]) + padding],
         ]
     )
-
     return m
 
 # ===========================
 # MAIN APP
 # ===========================
 def main():
-    # HERO
     st.title("🏥 South Carolina MHC Placement Decision Tool")
-    st.markdown(
-        "**Optimizing healthcare accessibility for South Carolina’s uninsured communities.**"
-    )
+    st.markdown("**Optimizing healthcare accessibility for South Carolina’s uninsured communities.**")
 
     st.markdown(
         """
@@ -745,13 +795,13 @@ def main():
 
             **Network Analysis (optional):**
             - Data source: OpenStreetMap via OSMnx
-            - Speeds: posted speed limits from OSM `maxspeed` tags 
+            - Speeds: posted speed limits from OSM `maxspeed` tags
             - Routing: Dijkstra shortest paths on a directed network
             - Turn penalties: 5 seconds per edge (approximation)
 
             **Manhattan Distance (default):**
             - Rectilinear distance times circuity factor (1.2)
-            - Driving speed: 25 mph average, walking: 5 km/h    
+            - Driving speed: 25 mph average, walking: 5 km/h
             """
         )
 
@@ -792,11 +842,11 @@ def main():
                 "Max Travel Time (min)", options=[5, 10, 15, 20, 30, 45], value=default_time
             )
 
-            # candidates in zip and by types, for max number of sites
-            if "geometry" in candidates_df.columns:
-                candidates_zip_all = candidates_df[candidates_df.geometry.intersects(zip_geom)]
+            # candidates in ZIP and by types, for max number of sites
+            if "zip_join" in candidates_df.columns and candidates_df["zip_join"].notna().any():
+                candidates_zip_all = candidates_df[candidates_df["zip_join"] == selected_zip]
             else:
-                candidates_zip_all = candidates_df[candidates_df["zip_code"] == selected_zip]
+                candidates_zip_all = candidates_df[candidates_df.geometry.intersects(zip_geom)]
 
             candidates_in_zip = candidates_zip_all[candidates_zip_all["type"].isin(selected_types)]
             max_facilities = len(candidates_in_zip)
@@ -823,10 +873,10 @@ def main():
         run_analysis = st.button("🚀 Calculate Optimal Sites", type="primary")
 
     # Demand in ZIP
-    if "geometry" in demand_df.columns:
-        demand_in_zip = demand_df[demand_df.geometry.intersects(zip_geom)]
+    if "zip_join" in demand_df.columns and demand_df["zip_join"].notna().any():
+        demand_in_zip = demand_df[demand_df["zip_join"] == selected_zip]
     else:
-        demand_in_zip = demand_df[demand_df["zip_code"] == selected_zip]
+        demand_in_zip = demand_df[demand_df.geometry.intersects(zip_geom)]
 
     total_uninsured = float(demand_in_zip["uninsured_pop"].sum()) if len(demand_in_zip) else 0.0
 
@@ -845,19 +895,21 @@ def main():
     if params_changed and not run_analysis:
         st.session_state.analysis_complete = False
         st.session_state.selected_facilities = None
+        st.session_state.coverage_matrix = None
+        st.session_state.demand_reset = None
+        st.session_state.candidates_reset = None
+        st.session_state.covered_mask = None
+        st.session_state.selected_cand_ids = None
+        st.session_state.covered_dem_ids = None
 
     # LAYOUT
     col_map, col_insights = st.columns([7, 3], gap="large")
 
     with col_insights:
         st.subheader("📊 Summary Statistics")
-
         st.metric("Total Uninsured Population", f"{int(round(total_uninsured)):,}")
         st.metric("Available Candidate Sites", f"{len(candidates_in_zip):,}")
         st.metric("Demand Points", f"{len(demand_in_zip):,}")
-
-        #if not st.session_state.analysis_complete:
-            #st.info("Set parameters, then click **Calculate Optimal Sites** to see coverage impact.")
 
     # If no candidates
     if len(candidates_in_zip) == 0:
@@ -879,19 +931,16 @@ def main():
                 buffer_m = 5000 if travel_mode == "drive" else 2000
 
                 try:
-                    with st.spinner("Downloading road network..."):
-                        graph_dist_m = estimate_required_graph_dist_m(
-                            zip_center.y,
-                            zip_center.x,
-                            candidates_in_zip,
-                            demand_in_zip,
-                            min_dist=15000,
-                            buffer_m=buffer_m,
-                        )
-                        G = get_cached_graph(
-                            zip_center.y, zip_center.x,
-                            graph_dist_m, network_type,
-                        )
+                    graph_dist_m = estimate_required_graph_dist_m(
+                        zip_center.y,
+                        zip_center.x,
+                        candidates_in_zip,
+                        demand_in_zip,
+                        min_dist=15000,
+                        buffer_m=buffer_m,
+                    )
+                    with st.spinner("Downloading or loading cached road network..."):
+                        G = get_osm_graph(zip_center.y, zip_center.x, int(graph_dist_m), network_type)
                     method_used = "Road Network (OSM maxspeed tags, turn penalties)"
                 except Exception as e:
                     st.warning(f"Network download failed, using Manhattan distance. Details: {e}")
@@ -907,8 +956,8 @@ def main():
                 G=G,
             )
 
-            demand_weights = demand_reset["uninsured_pop"].values
-            selected_indices, covered_pop = solve_maxcover(
+            demand_weights = demand_reset["uninsured_pop"].to_numpy(dtype=float)
+            selected_indices, covered_pop, covered_mask = solve_maxcover(
                 coverage_matrix,
                 demand_weights,
                 int(num_facilities),
@@ -916,18 +965,21 @@ def main():
 
             selected_facilities = candidates_reset.iloc[selected_indices]
 
+            # For fast map rendering, use stable IDs
+            selected_cand_ids = set(selected_facilities["cand_idx"].astype(int).tolist()) if "cand_idx" in selected_facilities.columns else set()
+            covered_dem_ids = set(demand_reset.loc[covered_mask, "dem_idx"].astype(int).tolist()) if "dem_idx" in demand_reset.columns else set()
+
             st.session_state.analysis_complete = True
             st.session_state.selected_facilities = selected_facilities
             st.session_state.coverage_matrix = coverage_matrix
             st.session_state.demand_reset = demand_reset
             st.session_state.candidates_reset = candidates_reset
             st.session_state.covered_pop = covered_pop
+            st.session_state.covered_mask = covered_mask
             st.session_state.method_used = method_used
             st.session_state.last_params = current_params
-            # Compute covered demand count ONCE (vectorized)
-            st.session_state.covered_demand_count = int(
-                np.any(coverage_matrix[selected_indices, :], axis=0).sum()
-            )
+            st.session_state.selected_cand_ids = selected_cand_ids
+            st.session_state.covered_dem_ids = covered_dem_ids
 
     # Map display
     with col_map:
@@ -939,25 +991,31 @@ def main():
                 selected_zip,
                 candidates_df,
                 demand_df,
-                selected_facilities=st.session_state.selected_facilities,
-                coverage_matrix=st.session_state.coverage_matrix,
-                demand_reset=st.session_state.demand_reset,
+                selected_cand_ids=st.session_state.selected_cand_ids,
+                covered_dem_ids=st.session_state.covered_dem_ids,
                 tiles=map_tiles,
             )
         else:
             m = create_map(zip_gdf, selected_zip, candidates_df, demand_df, tiles=map_tiles)
 
-        render_folium_map(m, key=f"map_{selected_zip}_{'done' if st.session_state.analysis_complete else 'base'}", height=640,)
+        render_folium_map(
+            m,
+            key=f"map_{selected_zip}_{'done' if st.session_state.analysis_complete else 'base'}",
+            height=640,
+        )
 
-    # Coverage metrics — rendered AFTER analysis so session state is populated
+    # Coverage metrics
     if st.session_state.analysis_complete:
         with col_insights:
             cov_pop = float(st.session_state.covered_pop)
             pct = (cov_pop / total_uninsured) * 100 if total_uninsured > 0 else 0.0
 
+            covered_count = int(np.sum(st.session_state.covered_mask)) if st.session_state.covered_mask is not None else 0
+            total_pts = len(st.session_state.demand_reset) if st.session_state.demand_reset is not None else 0
+
             st.metric("Covered Uninsured Population", f"{int(round(cov_pop)):,}")
             st.metric("Coverage Percentage", f"{pct:.1f}%")
-            st.metric("Covered Demand Points", f"{st.session_state.covered_demand_count} / {len(st.session_state.demand_reset)}")
+            st.metric("Covered Demand Points", f"{covered_count} / {total_pts}")
             st.progress(min(max(pct / 100.0, 0.0), 1.0))
             st.caption(f"Method: {st.session_state.method_used}")
 
@@ -969,13 +1027,16 @@ def main():
         selected_facilities = st.session_state.selected_facilities
         coverage_matrix = st.session_state.coverage_matrix
         demand_reset = st.session_state.demand_reset
+        covered_mask = st.session_state.covered_mask
 
-        st.caption(f"Covered demand points: {st.session_state.covered_demand_count:,} of {len(demand_reset):,}")
+        covered_demand_count = int(np.sum(covered_mask)) if covered_mask is not None else 0
+        st.caption(f"Covered demand points: {covered_demand_count:,} of {len(demand_reset):,}")
 
-        # Individual coverage per selected facility (simple ranking)
+        # Individual coverage per selected facility
+        demand_w = demand_reset["uninsured_pop"].to_numpy(dtype=float)
         facility_coverage = []
         for idx, _facility in selected_facilities.iterrows():
-            indiv_pop = float(np.sum(demand_reset["uninsured_pop"].values[coverage_matrix[idx, :] == 1]))
+            indiv_pop = float(demand_w[coverage_matrix[idx, :] == 1].sum())
             facility_coverage.append(indiv_pop)
 
         df_display = selected_facilities.copy()
