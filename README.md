@@ -1,4 +1,4 @@
-# South Carolina Facility Location Analysis Tool
+# South Carolina MHC Placement Decision Tool
 
 A Python-based interactive web application for optimal facility location selection using Maximum Coverage Location-Allocation analysis. Built with Streamlit for geospatial analysis of healthcare facility placement in South Carolina.
 
@@ -13,9 +13,9 @@ This tool helps identify optimal facility locations to maximize coverage of unin
 ## Features
 
 - ✅ Interactive ZIP code selection with dropdown
-- ✅ Multi-select facility types (Church, Primary Care, Grocery, etc.)
+- ✅ Multi-select facility types (Churches, Community Health Clinics, Food Banks, Homeless Services, Hospitals, Rural Primary Care)
 - ✅ Travel mode selection (Driving or Walking)
-- ✅ Configurable travel time thresholds (5-30 minutes)
+- ✅ Configurable travel time thresholds (5–45 minutes)
 - ✅ Adjustable number of facilities to select
 - ✅ Network-based travel time analysis using OSMnx
 - ✅ Manhattan distance approximation (faster alternative)
@@ -26,7 +26,7 @@ This tool helps identify optimal facility locations to maximize coverage of unin
 ## Requirements
 
 - Python 3.9 or higher
-- Your data file at the specified JSON path
+- Data file: `sc_app_data.json` (place in the project root folder)
 
 ## Installation
 
@@ -34,7 +34,7 @@ This tool helps identify optimal facility locations to maximize coverage of unin
 
 ```bash
 # Navigate to your project directory
-cd /path/to/your/project
+cd /path/to/sc_location_tool
 
 # Create virtual environment
 python3 -m venv venv
@@ -52,46 +52,43 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-**Note:** Installation may take 5-10 minutes due to geospatial libraries.
+> **Note:** Installation may take 5–10 minutes due to geospatial libraries.
 
 ### Step 3: Configure Data Path
 
-Open `app.py` and update line 24 with your data file path:
+Open `config.py` and update `JSON_PATH` to point to your data file:
 
 ```python
-JSON_PATH = Path("/Users/shtanim/Library/CloudStorage/Box-Box/Documents_Box_Tanim/MHC_Tool/data/raw/sc_app_data.json")
+JSON_PATH = Path("sc_app_data.json")  # relative path if file is in the project root
+# or an absolute path, e.g.:
+# JSON_PATH = Path("/your/full/path/to/sc_app_data.json")
 ```
+
+If `JSON_PATH` is not found and `ALLOW_FILE_UPLOAD = True`, the app will prompt you to upload the file directly in the browser.
 
 ## Data Format Requirements
 
-Your JSON file should contain three main sections:
+Your JSON file must contain three top-level sections:
 
-### 1. ZIP Code Boundaries
+### 1. ZIP Code Boundaries (`zips`)
 ```json
 {
-  "zip_boundaries": [
-    {
-      "type": "Feature",
-      "properties": {
-        "ZIP_CODE": "29630",
-        "po_name": "Clemson"
-      },
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [[[lon, lat], ...]]
-      }
+  "zips": {
+    "29630": {
+      "po_name": "Clemson",
+      "coords": [[lat, lon], [lat, lon], ...]
     }
-  ]
+  }
 }
 ```
 
-### 2. Candidate Facilities
+### 2. Candidate Facilities (`facilities`)
 ```json
 {
-  "candidate_facilities": [
+  "facilities": [
     {
       "facility_id": "F001",
-      "type": "Church",
+      "type": "Churches",
       "name": "First Baptist Church",
       "address": "123 Main St",
       "latitude": 34.6834,
@@ -102,10 +99,12 @@ Your JSON file should contain three main sections:
 }
 ```
 
-### 3. Demand Points (Census Block Centroids)
+Valid `type` values: `Churches`, `Community Health Clinics`, `Food Banks`, `Homeless Services`, `Hospitals`, `Rural Primary Care`
+
+### 3. Demand Points (`demand`)
 ```json
 {
-  "demand_points": [
+  "demand": [
     {
       "demand_id": "D001",
       "uninsured_pop": 150,
@@ -119,191 +118,169 @@ Your JSON file should contain three main sections:
 
 ## Running the Application
 
-### From Terminal (Recommended)
-
 ```bash
-# Make sure your virtual environment is activated
-source venv/bin/activate  # macOS/Linux
-# or
-venv\Scripts\activate  # Windows
+# Activate your virtual environment first
+source venv/bin/activate   # macOS/Linux
+venv\Scripts\activate      # Windows
 
-# Run the Streamlit app
+# Run the app
 streamlit run app.py
 ```
 
-The app will automatically open in your default web browser at `http://localhost:8501`
+The app will open automatically at `http://localhost:8501`.
 
-### From VS Code
-
-1. Open the `sc_location_tool` folder in VS Code
-2. Select your Python interpreter (the one in your venv)
-3. Open the integrated terminal (View → Terminal)
-4. Run: `streamlit run app.py`
-
-### From PyCharm
-
-1. Open the `sc_location_tool` folder as a project
-2. Configure the Python interpreter to use your virtual environment
-3. Right-click `app.py` → Run with Python Console
-4. Or use terminal: `streamlit run app.py`
-
-**Note:** You do NOT need Jupyter Notebook for this application. It runs entirely through Streamlit's web interface.
+You can also use the provided setup scripts:
+- **macOS/Linux**: `bash setup.sh`
+- **Windows**: `setup.bat`
 
 ## Usage Guide
 
-### 1. Select Analysis Parameters (Sidebar)
+### 1. Set Parameters (Sidebar)
 
-- **ZIP Code**: Choose a ZIP code from the dropdown (includes post office name)
-- **Facility Types**: Select which types to include (Church, Primary Care, Grocery, etc.)
-- **Travel Mode**: Choose Driving or Walking
-- **Travel Time**: Select maximum coverage time (5-30 minutes)
-- **Number of Facilities**: Set how many facilities to select
-- **Network Analysis**: Toggle for precise road network analysis (slower) vs. Manhattan distance (faster)
+| Control | Description |
+|---|---|
+| **Focus ZIP Code** | Select a ZIP code from the dropdown (includes city name) |
+| **Eligible Site Types** | Choose which facility types to include |
+| **Travel Mode** | Drive or Walk |
+| **Max Travel Time** | Coverage threshold in minutes (5–45 min) |
+| **Target Number of Sites** | How many facilities to optimally select |
+| **Enable Road-Network Routing** | Toggle for OSM road network (accurate but slower) vs. Manhattan distance (fast) |
 
-### 2. Run Analysis
+### 2. Run the Analysis
 
-Click the **"🔍 Run Analysis"** button to:
-- Build coverage matrix based on travel times
+Click **"🚀 Calculate Optimal Sites"** to:
+- Build a coverage matrix based on travel times
 - Solve the Maximum Coverage optimization problem
 - Display selected facilities on the map
 - Show coverage statistics
 
 ### 3. View Results
 
-- **Interactive Map**: Pan, zoom, and click markers for details
-  - Blue boundary = Selected ZIP code
-  - Purple/Red/Green markers = Candidate facilities (by type)
-  - Green stars = Selected optimal facilities
-  - Yellow circles = Demand points (sized by uninsured population)
-- **Statistics Panel**: View total and covered uninsured population
-- **Selected Facilities**: Expand each to see details
+**Interactive Map:**
+- Blue boundary = Selected ZIP code
+- Colored markers = Candidate facilities by type (purple = Churches, red = Community Health Clinics, green = Food Banks, blue = Homeless Services, dark red = Hospitals, pink = Rural Primary Care)
+- Gold stars = Optimally selected facilities
+- Yellow/green circles = Demand points (sized by uninsured population; green = covered, yellow = uncovered)
+
+**Summary Statistics Panel:**
+- Total uninsured population in ZIP
+- Number of available candidate sites
+- Covered uninsured population and percentage
+- Covered vs. total demand points
 
 ### 4. Export Results
 
-Download selected facilities as:
-- **CSV**: For spreadsheet analysis
-- **GeoJSON**: For GIS software
+Download the selected facilities as:
+- **CSV** — for spreadsheet analysis
+- **GeoJSON** — for GIS software (QGIS, ArcGIS, etc.)
 
 ## Coverage Calculation Method
 
 ### Coverage Definition
-Coverage is based on **uninsured population** within the specified travel time threshold:
-- Each demand point (census block centroid) has an associated uninsured population count
-- A demand point is "covered" if it's within the travel time threshold of at least one selected facility
-- Total coverage = sum of uninsured populations at all covered demand points
+A demand point (census block centroid) is "covered" if it falls within the specified travel time threshold of at least one selected facility. Total coverage = sum of uninsured population at all covered demand points.
 
-### Travel Time Calculation Methods
+### Travel Time Methods
 
-#### 1. Manhattan Distance (Default - Faster)
-- Approximates travel along a grid-like road network
-- Distance = |Δlat| + |Δlon| (converted to miles)
-- Travel time = distance / speed
-  - Driving: 30 mph average
-  - Walking: 3 mph average
-- **Pros**: Fast, no external data required
-- **Cons**: Less accurate for actual road routes
+#### Manhattan Distance (Default — Fast)
+- Rectilinear distance multiplied by a road circuity factor of 1.20
+- Driving speed: 25 mph average
+- Walking speed: 5 km/h (3.1 mph)
+- No internet connection required
 
-#### 2. Network Analysis (Optional - More Accurate)
-- Uses actual road network data from OpenStreetMap via OSMnx
-- Calculates shortest path along real roads
-- Considers road network topology
-- **Pros**: Most accurate travel times
-- **Cons**: Slower, requires internet for first run (cached afterward)
+#### Road Network Analysis (Optional — More Accurate)
+- Road network downloaded from OpenStreetMap via OSMnx
+- Speed data from actual OSM `maxspeed` tags, with SC-appropriate fallbacks per road class
+- Routing via Dijkstra's shortest path with a 5-second turn penalty per edge
+- Network is cached after the first download per ZIP code
 
 ### Optimization Model
-Uses **Maximum Coverage Location Problem (MCLP)**:
-- **Objective**: Maximize uninsured population covered within travel time threshold
+**Maximum Coverage Location Problem (MCLP)**:
+- **Objective**: Maximize total uninsured population covered within the travel time threshold
 - **Constraint**: Select exactly the specified number of facilities
-- **Solver**: PuLP with CBC optimizer
-- Guarantees optimal solution given the coverage matrix
+- **Solver**: PuLP with the CBC (COIN-OR Branch and Cut) integer linear programming solver
 
 ## Troubleshooting
 
-### "Error loading data"
-- Verify your JSON file path in `app.py` line 24
-- Ensure the file exists and is valid JSON
-- Check that all required fields are present
-
-### "No candidate facilities available"
-- The selected ZIP code may not have facilities of the chosen types
-- Try selecting different facility types or a different ZIP code
-
-### Network analysis is slow
-- First-time network download can take 1-2 minutes per ZIP code
-- Results are cached for subsequent runs
-- Consider using Manhattan distance for faster results
-
-### Import errors
-- Ensure all dependencies are installed: `pip install -r requirements.txt`
-- Try upgrading pip: `pip install --upgrade pip`
-- For macOS with M1/M2 chips, you may need to install packages via conda
-
-### Map not displaying
-- Check browser console for errors (F12)
-- Try refreshing the page
-- Ensure streamlit-folium is installed correctly
+| Problem | Solution |
+|---|---|
+| **Error loading data** | Check `JSON_PATH` in `config.py`; ensure the file is valid JSON with all required fields |
+| **No candidate facilities available** | Try different facility types or a different ZIP code |
+| **Network analysis is slow** | First download takes 1–2 min per ZIP; use Manhattan distance for faster results |
+| **Import errors** | Re-run `pip install -r requirements.txt`; upgrade pip with `pip install --upgrade pip` |
+| **Map not displaying / shaking** | Ensure you are using `streamlit-folium >= 0.15.0` with `returned_objects=[]` |
+| **Build errors on macOS (M1/M2)** | Install geospatial dependencies via `conda` instead of `pip` |
 
 ## Technical Architecture
 
-### Backend Components
-- **Streamlit**: Web application framework
-- **GeoPandas**: Geospatial data manipulation
-- **PuLP**: Linear programming optimization
-- **OSMnx**: Road network analysis
-- **NetworkX**: Graph algorithms
+**Backend:** Streamlit · GeoPandas · PuLP (CBC solver) · OSMnx · NetworkX · Shapely
 
-### Frontend Components
-- **Folium**: Interactive mapping
-- **Streamlit-Folium**: Integration bridge
+**Frontend:** Folium · streamlit-folium
 
-### Data Flow
-1. Load JSON data → Parse into DataFrames/GeoDataFrames
-2. User selects parameters → Filter data
-3. Calculate travel times → Build coverage matrix
-4. Solve optimization → Select optimal facilities
-5. Render results → Interactive map + statistics
-6. Export options → CSV/GeoJSON download
+**Data flow:**
+1. Load `sc_app_data.json` → parse into GeoDataFrames (cached)
+2. User sets parameters → filter candidates and demand points by ZIP and type
+3. Calculate travel times → build binary coverage matrix
+4. Solve MCLP optimization → select optimal facility set
+5. Render interactive map + statistics
+6. Export to CSV / GeoJSON
 
 ## Performance Notes
 
-- **Data Loading**: Cached after first load (~1-2 seconds)
-- **Manhattan Distance**: ~1-5 seconds per analysis
-- **Network Analysis**: ~30-120 seconds first time, ~5-10 seconds cached
-- **Map Rendering**: ~1-2 seconds
+| Operation | Typical Time |
+|---|---|
+| Data loading (first run) | 1–2 seconds (cached thereafter) |
+| Manhattan distance analysis | 1–5 seconds |
+| Network analysis (first run per ZIP) | 30–120 seconds |
+| Network analysis (cached) | 5–10 seconds |
+| Map rendering | 1–2 seconds |
 
 ## File Structure
 
 ```
 sc_location_tool/
-├── app.py                 # Main Streamlit application
-├── requirements.txt       # Python dependencies
-├── README.md             # This file
-└── venv/                 # Virtual environment (created by you)
+├── app.py                # Main Streamlit application
+├── config.py             # Configuration (data path, defaults, settings)
+├── requirements.txt      # Python dependencies
+├── packages.txt          # System-level dependencies for cloud deployment
+├── sc_app_data.json      # Geospatial data file (ZIP boundaries, facilities, demand)
+├── setup.sh              # Linux/macOS setup script
+├── setup.bat             # Windows setup script
+└── README.md             # This file
 ```
 
 ## Future Enhancements
 
-Potential features for future versions:
 - Multi-objective optimization (coverage + cost)
 - Temporal analysis (time-of-day traffic patterns)
-- Demographic stratification (coverage by age/income groups)
-- Scenario comparison tools
-- Batch analysis across multiple ZIP codes
-
-## Support
-
-For issues or questions:
-1. Check the Troubleshooting section
-2. Review your data format against requirements
-3. Check Streamlit documentation: https://docs.streamlit.io
-4. Verify all dependencies are correctly installed
-
-## License
-
-This tool is provided as-is for research and analysis purposes.
+- Demographic stratification (coverage by age/income group)
+- Scenario comparison across multiple ZIP codes
+- Integration with real-time population and insurance data
 
 ## Acknowledgments
 
 - OpenStreetMap contributors for road network data
-- PuLP/CBC for optimization capabilities
-- Streamlit team for the excellent framework
+- PuLP / CBC for optimization capabilities
+- Streamlit team for the application framework
+
+## Citation
+
+If you use this tool in your research, please cite the associated paper:
+
+**APA**
+> Tanim, S. H., White, D., Witrick, B., & Rennert, L. (2026). Optimizing Mobile Health Clinic Placement via Geospatial Modeling. *medRxiv*, 2025-12.
+
+**MLA**
+> Tanim, Shakhawat H., et al. "Optimizing Mobile Health Clinic Placement via Geospatial Modeling." *medRxiv* (2026): 2025-12.
+
+**Chicago**
+> Tanim, Shakhawat H., David White, Brian Witrick, and Lior Rennert. "Optimizing Mobile Health Clinic Placement via Geospatial Modeling." *medRxiv* (2026): 2025-12.
+
+**Harvard**
+> Tanim, S.H., White, D., Witrick, B. and Rennert, L., 2026. Optimizing Mobile Health Clinic Placement via Geospatial Modeling. *medRxiv*, pp.2025-12.
+
+**Vancouver**
+> Tanim SH, White D, Witrick B, Rennert L. Optimizing Mobile Health Clinic Placement via Geospatial Modeling. *medRxiv*. 2026 Jan 2:2025-12.
+
+## License
+
+This tool is provided as-is for research and analysis purposes.
