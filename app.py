@@ -147,9 +147,15 @@ local_css()
 # ===========================
 # SAFE MAP RENDERING (fixes JSON serialization error from st_folium)
 # ===========================
-def render_folium_map(m, key="map", height=640, width=1000):
+def render_folium_map(m, key="map", height=640):
     try:
-        st_folium(m, key=key, height=height, use_container_width=True)  # ← remove width, add this
+        st_folium(
+            m,
+            key=key,
+            height=height,
+            use_container_width=True,
+            returned_objects=[],   # ← THIS is what stops the infinite loop
+        )
     except Exception:
         components.html(m.get_root().render(), height=height, scrolling=True)
 
@@ -848,7 +854,6 @@ def main():
         with col_map:
             st.warning("No candidate facilities available for this ZIP and selected facility types.")
             m = create_map(zip_gdf, selected_zip, candidates_df, demand_df, tiles=map_tiles)
-            #render_folium_map(m, key=f"map_{selected_zip}_base", height=640, width=1000)
             render_folium_map(m, key=f"map_{selected_zip}_base", height=640)
         return
 
@@ -929,8 +934,7 @@ def main():
         else:
             m = create_map(zip_gdf, selected_zip, candidates_df, demand_df, tiles=map_tiles)
 
-        render_folium_map(m, key=f"map_{selected_zip}_{'done' if st.session_state.analysis_complete else 'base'}",
-                          height=640)
+        render_folium_map(m, key=f"map_{selected_zip}_{'done' if st.session_state.analysis_complete else 'base'}", height=640,)
 
     # Coverage metrics — rendered AFTER analysis so session state is populated
     if st.session_state.analysis_complete:
