@@ -67,6 +67,7 @@ import networkx as nx
 from shapely.geometry import Polygon
 from streamlit_folium import st_folium
 import warnings
+from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
 
@@ -147,12 +148,8 @@ local_css()
 # SAFE MAP RENDERING (fixes JSON serialization error from st_folium)
 # ===========================
 def render_folium_map(m, key="map", height=640, width=1000):
-    """
-    streamlit-folium sometimes fails with JSON serialization depending on version combos.
-    This helper tries st_folium first, then falls back to raw HTML rendering.
-    """
     try:
-        st_folium(m, key=key, height=height, width=width)
+        st_folium(m, key=key, height=height, use_container_width=True)  # ← remove width, add this
     except Exception:
         components.html(m.get_root().render(), height=height, scrolling=True)
 
@@ -160,7 +157,7 @@ def render_folium_map(m, key="map", height=640, width=1000):
 # CONFIGURATION
 # ===========================
 
-JSON_PATH = Path("sc_app_data.json")
+#JSON_PATH = Path("sc_app_data.json")
 
 
 DEFAULT_USE_NETWORK = False
@@ -851,7 +848,8 @@ def main():
         with col_map:
             st.warning("No candidate facilities available for this ZIP and selected facility types.")
             m = create_map(zip_gdf, selected_zip, candidates_df, demand_df, tiles=map_tiles)
-            render_folium_map(m, key=f"map_{selected_zip}_base", height=640, width=1000)
+            #render_folium_map(m, key=f"map_{selected_zip}_base", height=640, width=1000)
+            render_folium_map(m, key=f"map_{selected_zip}_base", height=640)
         return
 
     # Run analysis
@@ -932,7 +930,7 @@ def main():
             m = create_map(zip_gdf, selected_zip, candidates_df, demand_df, tiles=map_tiles)
 
         render_folium_map(m, key=f"map_{selected_zip}_{'done' if st.session_state.analysis_complete else 'base'}",
-                          height=640, width=1000)
+                          height=640)
 
     # Coverage metrics — rendered AFTER analysis so session state is populated
     if st.session_state.analysis_complete:
