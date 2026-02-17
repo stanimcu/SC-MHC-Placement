@@ -160,7 +160,7 @@ def render_folium_map(m, key="map", height=640, width=1000):
 # CONFIGURATION
 # ===========================
 
-#JSON_PATH = Path("sc_app_data.json")
+JSON_PATH = Path("sc_app_data.json")
 
 
 DEFAULT_USE_NETWORK = False
